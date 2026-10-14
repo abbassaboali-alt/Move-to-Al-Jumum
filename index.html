@@ -1,13 +1,248 @@
 <!DOCTYPE html>
-<html lang="ar" dir="rtl">
+<html lang="ar" dir="rtl" class="prudle-auth-pending">
 <head>
+<script>
+/* Prudle host allowlist + save-shortcut deterrent. Server-side Worker checks are authoritative. */
+(function(){
+"use strict";
+const LOGIN="https://www.prudle-education.com/log-in-out";
+const allowed=new Set(["www.prudle-education.com","prudle-education.com","abbassaboali-alt.github.io"]);
+window.addEventListener("keydown",function(e){if((e.ctrlKey||e.metaKey)&&String(e.key).toLowerCase()==="s")e.preventDefault();},{capture:true});
+if(location.protocol!=="https:"||!allowed.has(location.hostname.toLowerCase())){
+  window.stop();try{document.documentElement.innerHTML="";}catch(e){}
+  location.replace(LOGIN);return;
+}
+if(location.hostname.toLowerCase()==="prudle-education.com"){
+  window.stop();location.replace("https://www.prudle-education.com"+location.pathname+location.search+location.hash);
+}
+})();
+</script>
+<style>html.prudle-auth-pending body{visibility:hidden!important}</style>
+
+<script>
+/* PRUDLE WORKER ACCESS — no Firebase SDK or browser credentials.
+   Authenticates with an existing ID token issued by /auth/login on the Prudle login page.
+   The Worker MUST verify that token and enforce per-user collection/field permissions.
+   Legacy Firestore-style facade preserves application call sites; polling is not onSnapshot.
+*/
+(function(global){
+"use strict";
+const ENDPOINT="https://api-prudle.abbassaboali.workers.dev";
+const LOGIN="https://www.prudle-education.com/log-in-out";
+const CACHE_KEY="prudleAuthCacheV1";
+const PARENT_ORIGINS=["https://www.prudle-education.com","https://prudle-education.com"];
+const MAX_POLL=12000;
+let accessToken="", uid="", user=null, authCallbacks=[], expiryTimer=null, requestCount=0;
+const cleanups = new Set();
+const deny=()=>{
+  document.documentElement.classList.add("prudle-auth-pending");
+  cleanups.forEach(fn=>{try{fn();}catch(e){}});cleanups.clear();
+  for(const key of ["firebaseToken","firebaseUid"]){try{sessionStorage.removeItem(key);}catch(e){}}
+  for(const key of [CACHE_KEY,"firebaseToken","firebaseUid","authUid"]){try{localStorage.removeItem(key);}catch(e){}}
+  try{top.location.replace(LOGIN);}catch(e){location.replace(LOGIN);}
+};
+const jwt=t=>{try{let p=t.split(".")[1],v=p.replace(/-/g,"+").replace(/_/g,"/");return JSON.parse(atob(v.padEnd(Math.ceil(v.length/4)*4,"=")));}catch(e){return null;}};
+const valid=t=>{const p=jwt(t);return !!(p && Number(p.exp)*1000>Date.now()+5000);};
+function tokenFromStore(){
+  if(localStorage.getItem("prudleLoggedOut")==="1")return "";
+  let t="";
+  try{t=sessionStorage.getItem("firebaseToken")||"";}catch(e){}
+  if(valid(t))return t;
+  try{let c=JSON.parse(localStorage.getItem(CACHE_KEY)||"null");if(c&&valid(c.idToken))return c.idToken;}catch(e){}
+  try{t=localStorage.getItem("firebaseToken")||"";}catch(e){}
+  return valid(t)?t:"";
+}
+function fromParent(){
+ if(window.parent===window)return Promise.resolve("");
+ return new Promise(resolve=>{
+   let finished=false;
+   const finish=t=>{if(finished)return;finished=true;clearTimeout(timer);window.removeEventListener("message",listener);resolve(t||"");};
+   const listener=event=>{
+     if(event.source!==window.parent||!PARENT_ORIGINS.includes(event.origin))return;
+     const d=event.data;
+     if(d&&typeof d==="object"&&["PRUDLE_AUTH","PRUDLE_AUTH_RESPONSE"].includes(d.type)){
+       const token=d.idToken||d.firebaseToken||d.token||"";
+       if(valid(token))finish(token);
+     }
+   };
+   const timer=setTimeout(()=>finish(""),2500);
+   window.addEventListener("message",listener);
+   PARENT_ORIGINS.forEach(origin=>{try{window.parent.postMessage({type:"PRUDLE_AUTH_REQUEST",app:"prudle-protected"},origin);}catch(e){}});
+ });
+}
+function setToken(t){
+ if(!valid(t))return false;
+ accessToken=t;const p=jwt(t);uid=String(p.user_id||p.sub||"");
+ try{sessionStorage.setItem("firebaseToken",t);sessionStorage.setItem("firebaseUid",uid);
+   localStorage.setItem(CACHE_KEY,JSON.stringify({idToken:t,localId:uid,expiresAt:Number(p.exp)*1000}));
+ }catch(e){}
+ clearTimeout(expiryTimer);
+ expiryTimer=setTimeout(deny,Math.max(1,Number(p.exp)*1000-Date.now()));
+ return true;
+}
+function showNetError(err){
+ console.error("Prudle connection:",err);
+ document.documentElement.classList.add("prudle-auth-pending");
+ let shell=document.getElementById("prudle-worker-connection-error");
+ if(!shell){shell=document.createElement("aside");shell.id="prudle-worker-connection-error";
+ shell.style.cssText="position:fixed;z-index:2147483647;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:16px;background:#f5f7fb;color:#164478;font:700 16px Arial;text-align:center;padding:20px;visibility:visible";
+ shell.innerHTML='<div>Connection to Prudle is temporarily unavailable.</div><button type="button" style="background:#164478;color:white;border:0;border-radius:9px;padding:12px 24px;font:700 15px Arial;cursor:pointer">Retry</button>';
+ shell.querySelector("button").addEventListener("click",()=>location.reload());document.documentElement.appendChild(shell);
+ }
+}
+async function request(payload){
+ let t=accessToken||tokenFromStore();if(!valid(t)){deny();throw new Error("AUTH_REQUIRED");}
+ const controller=new AbortController(),timer=setTimeout(()=>controller.abort(),12000);
+ try{
+  const res=await fetch(ENDPOINT+"/db",{method:"POST",headers:{"Content-Type":"application/json","Authorization":"Bearer "+t},body:JSON.stringify(payload),signal:controller.signal,cache:"no-store",credentials:"omit"});
+  let body=await res.json().catch(()=>({}));
+  if(res.status===401||res.status===403){deny();throw new Error("AUTH_REQUIRED");}
+  if(!res.ok||body.success===false||body.ok===false)throw new Error(body.error||body.message||"Worker HTTP "+res.status);
+  return body;
+ }finally{clearTimeout(timer);}
+}
+const value=v=>{
+ if(!v||typeof v!=="object")return v;
+ if("stringValue" in v)return v.stringValue;
+ if("integerValue" in v)return Number(v.integerValue);
+ if("doubleValue" in v)return Number(v.doubleValue);
+ if("booleanValue" in v)return v.booleanValue;
+ if("nullValue" in v)return null;
+ if("timestampValue" in v)return dateValue(v.timestampValue);
+ if("arrayValue" in v)return (v.arrayValue.values||[]).map(value);
+ if("mapValue" in v)return Object.fromEntries(Object.entries(v.mapValue.fields||{}).map(([k,z])=>[k,value(z)]));
+ return v;
+};
+function dateValue(input){
+ let d=new Date(input);if(Number.isNaN(d.getTime()))return input;
+ return {seconds:Math.floor(d.getTime()/1000),nanoseconds:(d.getTime()%1000)*1e6,toDate:()=>new Date(d),toMillis:()=>d.getTime()};
+}
+function decode(v){
+ if(Array.isArray(v))return v.map(decode);
+ if(!v||typeof v!=="object")return v;
+ if("seconds" in v&&Object.keys(v).some(k=>k==="nanoseconds"))return {seconds:Number(v.seconds),nanoseconds:Number(v.nanoseconds),toDate:()=>new Date(Number(v.seconds)*1000+Number(v.nanoseconds||0)/1e6),toMillis:()=>Number(v.seconds)*1000+Number(v.nanoseconds||0)/1e6};
+ if("timestampValue" in v||"mapValue" in v||"arrayValue" in v||"stringValue" in v)return value(v);
+ return Object.fromEntries(Object.entries(v).map(([k,z])=>[k,decode(z)]));
+}
+function extractDoc(raw,fallback,collection){
+ if(!raw||typeof raw!=="object")return null;
+ const id=String(raw.id||raw.documentId||(raw.name||raw.path||"").split("/").pop()||fallback||"");
+ if(!id)return null;
+ const fields=raw.data&&typeof raw.data==="object"?raw.data:raw.fields&&typeof raw.fields==="object"?Object.fromEntries(Object.entries(raw.fields).map(([k,v])=>[k,value(v)])):raw;
+ const data=decode(fields);
+ return {id,exists:raw.exists!==false,ref:new DocRef(collection,id),data:()=>data};
+}
+function docsFromBody(body,collection){
+ let list=body?.data?.documents||body?.documents||body?.data?.docs||body?.snapshot?.docs||body?.docs;
+ if(!Array.isArray(list))throw new Error("Unexpected Worker query response. Expected documents array.");
+ return list.map(d=>extractDoc(d,"",collection)).filter(Boolean);
+}
+function snapshot(docs){return {docs,empty:docs.length===0,size:docs.length,forEach:fn=>docs.forEach(fn)};}
+const serverVal={__prudleServerTimestamp:true};
+const delVal={__prudleDeleteField:true};
+function encode(v){
+ if(v===undefined)return null;
+ if(v&&typeof v==="object"){
+  if(v.__prudleServerTimestamp)return new Date().toISOString();
+  if(v.__prudleDeleteField)return {__prudleDeleteField:true};
+  if(v.__prudleArrayUnion)return {__prudleArrayUnion:true,values:(v.values||[]).map(encode)};
+  if(v instanceof Date)return {__type:"timestamp",value:v.toISOString()};
+  if(typeof v.toDate==="function"&&Number.isFinite(v.seconds))return {__type:"timestamp",value:v.toDate().toISOString()};
+  if(Array.isArray(v))return v.map(encode);
+  return Object.fromEntries(Object.entries(v).map(([k,z])=>[k,encode(z)]));
+ }
+ return v;
+}
+function hasSpecial(v){if(!v||typeof v!=="object")return false;return !!(v.__prudleDeleteField||v.__prudleArrayUnion||(Object.values(v).some(hasSpecial)));}
+function getNested(obj,path){return path.split(".").reduce((a,k)=>a&&a[k],obj);}
+function setNested(obj,path,v){let parts=path.split("."),parent=obj;for(let i=0;i<parts.length-1;i++){let k=parts[i];if(!parent[k]||typeof parent[k]!=="object")parent[k]={};parent=parent[k];}const end=parts[parts.length-1];if(v?.__prudleDeleteField){delete parent[end];return;}if(v?.__prudleArrayUnion){let old=Array.isArray(parent[end])?parent[end]:[];parent[end]=old.concat(v.values.filter(x=>!old.some(y=>JSON.stringify(y)===JSON.stringify(x))));return;}parent[end]=v;}
+class Query{
+ constructor(collection,filters=[],ordering=null,max=null){this.path=collection;this.filters=filters;this.ordering=ordering;this.max=max;}
+ where(field,op,val){return new Query(this.path,this.filters.concat([{field,op,value:val}]),this.ordering,this.max);}
+ orderBy(field,direction="asc"){return new Query(this.path,this.filters,{field,direction},this.max);}
+ limit(max){return new Query(this.path,this.filters,this.ordering,max);}
+ doc(id){return new DocRef(this.path,id||newId());}
+ async add(data){const ref=this.doc();await ref.set(data);return ref;}
+ async get(){let req={action:"query",collection:this.path};if(this.filters.length)req.filters=this.filters.map(z=>({...z,value:encode(z.value)}));if(this.ordering)req.orderBy=[this.ordering];req.limit=this.max||500;const docs=docsFromBody(await request(req),this.path);
+  // /db defaults to 100 results and caps queries at 500. Request up to 500
+  // explicitly and reject a full-size response when completeness is uncertain.
+  if(!this.max && docs.length>=500){const error=new Error("RESULT_LIMIT_REACHED: /db can return only 500 documents per query; pagination must be added to the existing Worker before this result is safe.");error.code="RESULT_LIMIT_REACHED";throw error;}
+  return snapshot(docs);}
+ onSnapshot(ok,fail){let closed=false,busy=false,last="",timer=null;
+ const poll=async()=>{if(closed||busy)return;busy=true;try{let snap=await this.get();const serialized=JSON.stringify(snap.docs.map(x=>[x.id,x.data()]));if(serialized!==last){last=serialized;if(!closed)ok(snap);}}catch(e){if(!closed&&typeof fail==="function")fail(e);}finally{busy=false;}};
+ poll();timer=setInterval(poll,MAX_POLL);const unsub=()=>{closed=true;clearInterval(timer);cleanups.delete(unsub);};cleanups.add(unsub);return unsub;}
+}
+class DocRef{
+ constructor(path,id){this.path=path;this.id=String(id);}
+ get fullPath(){return this.path+"/"+this.id;}
+ collection(sub){return new Query(this.fullPath+"/"+sub);}
+ async get(){const body=await request({action:"getDoc",path:this.fullPath});let raw=body?.data?.document||body?.document||body?.data||body;
+ if(raw.exists===false||raw.found===false||raw.document===null||body.data===null)return {id:this.id,exists:false,ref:this,data:()=>undefined};
+ return extractDoc(raw,this.id,this.path)||{id:this.id,exists:false,ref:this,data:()=>undefined};}
+ async set(data,opt={}){let body={action:"setDoc",path:this.fullPath,data:encode(data),merge:!!opt.merge};return request(body);}
+ async update(data){const next=encode(data);
+ if(hasSpecial(next)){
+  // Non-atomic compatibility fallback. Prefer a native Worker field-transform endpoint for full parity.
+  const old=await this.get();if(!old.exists)throw new Error("Document does not exist");const obj={...old.data()};
+  Object.entries(next).forEach(([k,v])=>setNested(obj,k,v));return this.set(obj,{merge:false});
+ }
+ return request({action:"updateDoc",path:this.fullPath,data:next});}
+ async delete(){return request({action:"deleteDoc",path:this.fullPath});}
+ onSnapshot(ok,fail){let cancelled=false;const q=new Query(this.path).where("__name__","==",this.id);
+ const tick=async()=>{if(cancelled)return;try{let d=await this.get();if(!cancelled)ok(d);}catch(e){if(!cancelled&&fail)fail(e);}};tick();const timer=setInterval(tick,MAX_POLL);const unsub=()=>{cancelled=true;clearInterval(timer);cleanups.delete(unsub);};cleanups.add(unsub);return unsub;}
+}
+function newId(){const arr=new Uint8Array(15);crypto.getRandomValues(arr);const abc="ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";return Array.from(arr,x=>abc[x%abc.length]).join("")+"abcde";}
+class Batch{
+ constructor(){this.ops=[];}
+ set(r,v,opt){this.ops.push(()=>r.set(v,opt));return this;}
+ update(r,v){this.ops.push(()=>r.update(v));return this;}
+ delete(r){this.ops.push(()=>r.delete());return this;}
+ async commit(){// Explicitly sequential, NOT Firestore atomic batch.
+  for(const operation of this.ops)await operation();}
+}
+const db={collection:name=>new Query(name),batch:()=>new Batch(),enablePersistence:async()=>{}};
+const auth={get currentUser(){return user;},onAuthStateChanged(fn){authCallbacks.push(fn);if(user)queueMicrotask(()=>fn(user));return ()=>{authCallbacks=authCallbacks.filter(x=>x!==fn);};},async signOut(){accessToken="";user=null;deny();}};
+const fieldValue={serverTimestamp:()=>({__type:"serverTimestamp"}),delete:()=>({...delVal}),arrayUnion:(...values)=>({__prudleArrayUnion:true,values})};
+function firestore(){return db;}
+firestore.FieldValue=fieldValue;
+firestore.Timestamp={fromDate:date=>dateValue(date),now:()=>dateValue(new Date())};
+const firebase={apps:[{}],auth:()=>auth,firestore};
+async function boot(){
+ try{
+  let t=tokenFromStore()||await fromParent();
+  if(!setToken(t)||!uid){deny();return;}
+  // /db request verifies token server-side; never trust JWT or browser role for data access.
+  const check=await request({action:"query",collection:"USERS",filters:[{field:"authUid",op:"==",value:uid}],limit:1});
+  const records=docsFromBody(check,"USERS");
+  if(!records.length){deny();return;}
+  const profile=records[0].data();
+  const rawRoles=Array.isArray(profile.roles)?profile.roles:typeof profile.roles==="string"?profile.roles.split(","):[];
+  if(profile.role)rawRoles.push(profile.role);
+  const roles=[...new Set(rawRoles.map(x=>String(x||"").trim().toLowerCase()).filter(Boolean))];
+  if(!roles.includes("admin")){
+   console.warn("Prudle access denied: authenticated account does not have the admin role");
+   deny();return;
+  }
+  user={uid,getIdToken:async()=>accessToken,email:null};
+  global.__prudleAuthenticatedProfile={...profile,roles,authUid:uid};
+  for(const cb of authCallbacks){await cb(user);}
+  global.dispatchEvent(new CustomEvent("prudle-worker-auth-ready",{detail:{profile:global.__prudleAuthenticatedProfile,uid}}));
+ }catch(e){if(e.message!=="AUTH_REQUIRED")showNetError(e);}
+}
+window.addEventListener("storage",e=>{if([CACHE_KEY,"prudleLoggedOut","firebaseToken"].includes(e.key)&&(!e.newValue||e.newValue==="1"))deny();});
+global.prudleWorker={request,db,auth,boot,deny,getToken:()=>accessToken||tokenFromStore(),getUid:()=>uid,fromParent,tokenFromStore,valid};
+global.firebase=firebase;
+// Wait for all regular protected applications to register their onAuthStateChanged callbacks.
+if(document.readyState==="loading")document.addEventListener("DOMContentLoaded",boot,{once:true});else queueMicrotask(boot);
+})(window);
+
+</script>
+
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width,initial-scale=1.0" />
 <title>الترحيل للدورات — Prudle</title>
 
 <!-- Firebase -->
-<script src="https://www.gstatic.com/firebasejs/11.0.1/firebase-app-compat.js"></script>
-<script src="https://www.gstatic.com/firebasejs/11.0.1/firebase-firestore-compat.js"></script>
 
 <!-- Excel -->
 <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
@@ -549,36 +784,19 @@ tr.dup-row{background:#ffebee !important}
 </div>
 
 <script>
-/* ================= Logout + Protection ================= */
+/* ================= Worker logout (existing no-extra-screen behavior) ================= */
 function logout(){
-
-  /* حذف بيانات GitHub نفسها */
-  localStorage.clear();
-  sessionStorage.clear();
-
-  /*
-    إذا كانت الصفحة داخل iframe:
-    نرسل أمر الخروج إلى صفحة Prudle الحاضنة،
-    وهي التي تحذف تسجيل الدخول الحقيقي وتعيد التوجيه.
-  */
-  if(window.parent !== window){
-
-    window.parent.postMessage(
-      "PRUDLE_LOGOUT",
-      "https://www.prudle-education.com"
-    );
-
-    return;
+  try{window.prudleWorker?.deny && document.documentElement.classList.add("prudle-auth-pending");}catch(_){}
+  localStorage.setItem("prudleLoggedOut","1");
+  for(const key of ["prudleAuthCacheV1","firebaseToken","firebaseUid","authUid","username","role","userRole","roles","loginDate"]){
+    try{localStorage.removeItem(key);sessionStorage.removeItem(key);}catch(_){}
   }
-
-  /*
-    إذا تم فتح صفحة GitHub مباشرة.
-  */
-  window.location.replace(
-    "https://www.prudle-education.com/log-in-out"
-  );
+  if(window.parent !== window){
+    try{window.parent.postMessage("PRUDLE_LOGOUT","https://www.prudle-education.com");}catch(_){}
+  }
+  try{window.top.location.replace("https://www.prudle-education.com/log-in-out");}
+  catch(_){window.location.replace("https://www.prudle-education.com/log-in-out");}
 }
-
 
 /* ================= Prevent Submit (Weebly) ================= */
 document.addEventListener("submit", function(e){
@@ -586,13 +804,29 @@ document.addEventListener("submit", function(e){
   e.stopPropagation();
 }, true);
 
-/* ================= FIREBASE ================= */
-firebase.initializeApp({
-  apiKey:"AIzaSyCCFBvZosI8dwShZjxvZzI-SU5igEbcOKk",
-  authDomain:"prudle-system.firebaseapp.com",
-  projectId:"prudle-system"
-});
-const db = firebase.firestore();
+/* ================= PRUDLE WORKER / VERIFIED ADMIN ================= */
+const db = window.prudleWorker.db;
+const auth = window.prudleWorker.auth;
+let PRUDLE_ADMIN_READY = false;
+// Never trust a localStorage role as proof of admin rights. The Worker /db
+// request validates the Firebase token, and boot() matches USERS.authUid.
+function startVerifiedAdminApp(firebaseUser){
+  const profile=window.__prudleAuthenticatedProfile;
+  if(!firebaseUser || !profile || profile.authUid!==firebaseUser.uid ||
+     !Array.isArray(profile.roles) || !profile.roles.includes("admin")){
+    window.prudleWorker.deny();return;
+  }
+  if(PRUDLE_ADMIN_READY)return;
+  PRUDLE_ADMIN_READY=true;
+  localStorage.setItem("username",String(profile.username||profile.userName||profile.name||profile.fullName||"").trim());
+  localStorage.setItem("role","admin");
+  localStorage.setItem("userRole","admin");
+  localStorage.setItem("roles",JSON.stringify(profile.roles));
+  localStorage.setItem("loginDate",new Date().toDateString());
+  localStorage.setItem("authUid",firebaseUser.uid);
+  document.documentElement.classList.remove("prudle-auth-pending");
+  beginAdminData();
+}
 
 /* ================= DOM ================= */
 const fStatus = document.getElementById("fStatus");
@@ -741,22 +975,28 @@ function endSubHTML(total, used){
   );
 }
 
-/* ================= SAFE QUERY (Fallback) ================= */
+/* ================= WORKER-SAFE QUERY (No silent broad fallback) ================= */
 async function queryWithFallback(col, filtersA, filtersB){
-  const run = async filters=>{
-    let q = db.collection(col);
-    for(const f of filters) q = q.where(f[0], f[1], f[2]);
-    return await q.get();
-  };
-  try{
-    const a = await run(filtersA);
-    if(!a.empty) return a;
-  }catch(e){}
-  try{
-    return await run(filtersB);
-  }catch(e){
-    return await db.collection(col).limit(3000).get();
+  // Two known existing Prudle schemas. Keep the original fields and document IDs.
+  // Never fall back to an unfiltered .limit(3000) scan: /db caps at 500.
+  const collected=new Map();
+  let successful=0, lastError=null;
+  for(const filters of [filtersA, filtersB]){
+    try{
+      let q=db.collection(col);
+      for(const f of filters)q=q.where(f[0],f[1],f[2]);
+      const snap=await q.get();
+      successful++;
+      snap.docs.forEach(doc=>collected.set(doc.id,doc));
+    }catch(error){
+      if(error.code==="RESULT_LIMIT_REACHED")throw error;
+      lastError=error;
+      console.warn("Prudle query failed",col,error);
+    }
   }
+  if(!successful)throw lastError||new Error("Unable to query "+col);
+  return {docs:[...collected.values()],empty:collected.size===0,size:collected.size,
+          forEach(fn){this.docs.forEach(fn);}};
 }
 
 /* ================= LEVELS (students) — مثل آلية الكود الأول ================= */
@@ -840,6 +1080,7 @@ async function prefetchLevelsForRows(rows, concurrency){
 }
 
 /* ================= TARGET COURSES (OPEN ONLY) ================= */
+function startTargetCoursesListener(){
 db.collection("Courses")
 .where("status","==","open")
 .where("Branch","==","Al-Jumum")
@@ -856,7 +1097,13 @@ db.collection("Courses")
     `;
   });
   if(FILTERED.length) render();
+}, error=>{
+  console.error("Failed to load open Al-Jumum courses:",error);
+  TARGET_COURSES=[];
+  targetCourse.innerHTML="<option value=''>تعذر تحميل الدورات المفتوحة — أعد المحاولة</option>";
+  hint.textContent="تعذر جلب الدورات كاملة من Worker. لا يمكن الترحيل قبل إصلاح الاستعلام.";
 });
+}
 function getCourseName(x){
   return (
     x.TrainingCourse ||
@@ -907,6 +1154,7 @@ async function loadData(){
   const baseA = [["Branch","==","Al-Jumum"],["CourseType","==","حضوري"]];
   const baseB = [["branch","==","Al-Jumum"],["mode","==","حضوري"]];
 
+  try {
   const [frSnap, fpSnap] = await Promise.all([
     queryWithFallback("FakeRegistrations", baseA, baseB),
     queryWithFallback("FakePromotions", baseA, baseB)
@@ -1056,7 +1304,17 @@ r.remainingLevels =
   }
 
   fillFilters();
-  applyFilters(); // يعرض الجديد فقط افتراضيًا + يخفي ناجح/راسب إلا عند الفلترة/الحالة
+   for(const btn of [btnDelete,btnMigrate,btnBulkFees,btnBulkLevels,btnAll])btn.disabled=false;
+   applyFilters(); // يعرض الجديد فقط افتراضيًا + يخفي ناجح/راسب إلا عند الفلترة/الحالة
+  } catch(error){
+    console.error("Prudle admin migration data error",error);
+    ROWS=[];FILTERED=[];SELECTED=[];
+    tbody.innerHTML='<tr><td colspan="24" class="notice">تعذر تحميل كل بيانات الطلاب. يرجى إعادة المحاولة أو مراجعة حد الاستعلام في Worker.</td></tr>';
+    hint.textContent=error.code==="RESULT_LIMIT_REACHED"
+      ? "وصل أحد استعلامات Worker إلى 500 سجل. يجب دعم Pagination في Worker قبل اعتماد هذه القائمة."
+      : "حدث خطأ أثناء استرجاع سجلات الترحيل.";
+    for(const btn of [btnDelete,btnMigrate,btnBulkFees,btnBulkLevels,btnAll])btn.disabled=true;
+  }
 }
 
 /* ================= FILL FILTERS ================= */
@@ -1822,8 +2080,12 @@ btnImport.onclick = async ()=>{
   loadData();
 };
 
-/* ================= INIT ================= */
-loadData();
+/* ================= INIT — only after verified ADMIN profile ================= */
+function beginAdminData(){
+  startTargetCoursesListener();
+  void loadData();
+}
+auth.onAuthStateChanged(startVerifiedAdminApp);
 </script>
 
 </body>
